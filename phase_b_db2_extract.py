@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Phase B extractor with per-query logging for DB2 LUW -> PostgreSQL.
+"""Phase B COMPLETE v4 (2026-08-13), with per-query DB2 logging.
 
 Requires: pip install ibm_db
 Credentials are never stored in output. Connection values come from CLI/env.
+
+Visible verification markers:
+- E1 has 3 queries (1-of-3, 2-of-3, 3-of-3).
+- E4 has 2 queries (1-of-2, 2-of-2).
+- Literal coverage validation runs before any DB2 connection.
 """
 from __future__ import annotations
 
@@ -36,6 +41,52 @@ class Query:
 
 LOG = logging.getLogger("phase_b_db2_extract")
 
+# Literal checklist. The document contains 45 fixed SQL statements plus the P12
+# COUNT(*) template. Seven fixed extraction queries are supplemental because
+# P10, P11 and P14 describe required inputs without printing all extraction SQL,
+# and P12 needs a safe catalog query to select its top 50 tables.
+DOCUMENT_FIXED_SLUGS = {
+    "E": {
+        "E1-query-1-of-3-version-fixpack",
+        "E1-query-2-of-3-instance-topology",
+        "E1-query-3-of-3-system-platform",
+        "E2-query-1-of-4-dbpartitiongroups",
+        "E2-query-2-of-4-dbpartitiongroupdef",
+        "E2-query-3-of-4-table-partition-groups",
+        "E2-query-4-of-4-distribution-keys",
+        "E3-query-1-of-1-dbcfg",
+        "E4-query-1-of-2-reg-variables-filtered",
+        "E4-query-2-of-2-reg-variables-all",
+        "E5-query-1-of-5-tablespaces",
+        "E5-query-2-of-5-bufferpools",
+        "E5-query-3-of-5-mdc-indexes",
+        "E5-query-4-of-5-data-partitions",
+        "E5-query-5-of-5-table-organization",
+    },
+    "P9": {
+        "09a-object-counts", "09b-table-metrics", "09c-physical-size",
+        "09d-routine-counts", "09e-routine-bodies", "09f-trigger-bodies",
+        "09g-constraints", "09g-sequences", "09g-generated-columns",
+        "09h-periods", "09h-controls", "09h-special-types",
+        "09i-wrappers", "09i-servers", "09i-nicknames", "09i-server-options",
+        "09i-user-options", "09i-function-mappings", "09i-type-mappings",
+        "09i-nickname-dependencies",
+    },
+    "P12": {"12-lob-inventory"},
+    "P13": {
+        "13a-read-grants", "13b-write-grants", "13c-routine-grants",
+        "13d-packages", "13e-package-statements",
+        "13f-cross-schema-table-deps", "13f-cross-schema-routine-deps",
+        "13g-current-sql", "13g-connection-summary",
+    },
+}
+SUPPLEMENTAL_FIXED_SLUGS = {
+    "P10": {"10-columns"},
+    "P11": {"11-routine-bodies", "11-trigger-bodies", "11-views", "11-package-statements"},
+    "P12": {"12-top-50-tables"},
+    "P14": {"14-dbauth"},
+}
+
 
 def configure_logging(log_file: Path, verbose: bool) -> None:
     """Log progress to console and a UTF-8 file without connection secrets."""
@@ -68,19 +119,21 @@ def queries(schemas: list[str]) -> list[Query]:
     rs = schema_pred("ROUTINESCHEMA", schemas)
     trgs = schema_pred("TRIGSCHEMA", schemas)
     base = [
-        Query("E", "E1-env-inst-info", "SELECT SERVICE_LEVEL, FIXPACK_NUM, BLD_LEVEL, INST_NAME, IS_INST_PARTITIONABLE, NUM_DBPARTITIONS FROM SYSIBMADM.ENV_INST_INFO"),
-        Query("E", "E1-env-sys-info", "SELECT OS_NAME, OS_VERSION, OS_RELEASE, HOST_NAME, TOTAL_CPUS, TOTAL_MEMORY FROM SYSIBMADM.ENV_SYS_INFO"),
-        Query("E", "E2-dbpartitiongroups", "SELECT * FROM SYSCAT.DBPARTITIONGROUPS"),
-        Query("E", "E2-dbpartitiongroupdef", "SELECT * FROM SYSCAT.DBPARTITIONGROUPDEF"),
-        Query("E", "E2-table-partition-groups", f"SELECT S.DBPGNAME, T.TABSCHEMA, T.TABNAME FROM SYSCAT.TABLES T JOIN SYSCAT.TABLESPACES S ON T.TBSPACEID=S.TBSPACEID WHERE {ts}"),
-        Query("E", "E2-distribution-keys", f"SELECT TABSCHEMA,TABNAME,COLNAME,PARTKEYSEQ FROM SYSCAT.COLUMNS WHERE {s} AND PARTKEYSEQ>0 ORDER BY TABSCHEMA,TABNAME,PARTKEYSEQ"),
-        Query("E", "E3-dbcfg", "SELECT * FROM SYSIBMADM.DBCFG WHERE NAME IN ('codeset','codepage','territory','collate_info','alt_collate','string_units','date_compat','number_compat','varchar2_compat','cur_commit','decflt_rounding','pagesize')"),
-        Query("E", "E4-reg-variables", "SELECT NAME,VALUE,VALUE_FLAGS FROM SYSIBMADM.REG_VARIABLES", True, "VALUE_FLAGS can vary by DB2 level"),
-        Query("E", "E5-tablespaces", "SELECT TBSPACE,TBSPACETYPE,DATATYPE,PAGESIZE,EXTENTSIZE,PREFETCHSIZE,BUFFERPOOLID FROM SYSCAT.TABLESPACES"),
-        Query("E", "E5-bufferpools", "SELECT BPNAME,NPAGES,PAGESIZE FROM SYSCAT.BUFFERPOOLS"),
-        Query("E", "E5-mdc-indexes", f"SELECT TABSCHEMA,TABNAME,INDNAME,INDEXTYPE FROM SYSCAT.INDEXES WHERE {s} AND INDEXTYPE IN ('BLOK','DIM')"),
-        Query("E", "E5-data-partitions", f"SELECT TABSCHEMA,TABNAME,DATAPARTITIONNAME,SEQNO,LOWVALUE,HIGHVALUE FROM SYSCAT.DATAPARTITIONS WHERE {s} ORDER BY TABSCHEMA,TABNAME,SEQNO", True),
-        Query("E", "E5-table-organization", f"SELECT TABSCHEMA,TABNAME,COMPRESSION,ROWCOMPMODE,TABLEORG FROM SYSCAT.TABLES WHERE {s} AND TYPE='T'"),
+        Query("E", "E1-query-1-of-3-version-fixpack", "SELECT SERVICE_LEVEL,FIXPACK_NUM,BLD_LEVEL FROM SYSIBMADM.ENV_INST_INFO"),
+        Query("E", "E1-query-2-of-3-instance-topology", "SELECT INST_NAME,IS_INST_PARTITIONABLE,NUM_DBPARTITIONS FROM SYSIBMADM.ENV_INST_INFO"),
+        Query("E", "E1-query-3-of-3-system-platform", "SELECT OS_NAME,OS_VERSION,OS_RELEASE,HOST_NAME,TOTAL_CPUS,TOTAL_MEMORY FROM SYSIBMADM.ENV_SYS_INFO"),
+        Query("E", "E2-query-1-of-4-dbpartitiongroups", "SELECT * FROM SYSCAT.DBPARTITIONGROUPS"),
+        Query("E", "E2-query-2-of-4-dbpartitiongroupdef", "SELECT * FROM SYSCAT.DBPARTITIONGROUPDEF"),
+        Query("E", "E2-query-3-of-4-table-partition-groups", f"SELECT S.DBPGNAME,T.TABSCHEMA,T.TABNAME FROM SYSCAT.TABLES T JOIN SYSCAT.TABLESPACES S ON T.TBSPACEID=S.TBSPACEID WHERE {ts}"),
+        Query("E", "E2-query-4-of-4-distribution-keys", f"SELECT TABSCHEMA,TABNAME,COLNAME,PARTKEYSEQ FROM SYSCAT.COLUMNS WHERE {s} AND PARTKEYSEQ>0 ORDER BY TABNAME,PARTKEYSEQ"),
+        Query("E", "E3-query-1-of-1-dbcfg", "SELECT * FROM SYSIBMADM.DBCFG WHERE NAME IN ('codeset','codepage','territory','collate_info','alt_collate','string_units','date_compat','number_compat','varchar2_compat','cur_commit','decflt_rounding','pagesize')"),
+        Query("E", "E4-query-1-of-2-reg-variables-filtered", "SELECT NAME,VALUE,VALUE_FLAGS FROM SYSIBMADM.REG_VARIABLES WHERE NAME IN ('DB2_COMPATIBILITY_VECTOR','DB2_DEFERRED_PREPARE_SEMANTICS','DB2_WORKLOAD','DB2COMPOPT')", True, "Document E4 query 1 of 2; VALUE_FLAGS can vary by DB2 level"),
+        Query("E", "E4-query-2-of-2-reg-variables-all", "SELECT NAME,VALUE FROM SYSIBMADM.REG_VARIABLES", True, "Document E4 query 2 of 2"),
+        Query("E", "E5-query-1-of-5-tablespaces", "SELECT TBSPACE,TBSPACETYPE,DATATYPE,PAGESIZE,EXTENTSIZE,PREFETCHSIZE,BUFFERPOOLID FROM SYSCAT.TABLESPACES"),
+        Query("E", "E5-query-2-of-5-bufferpools", "SELECT BPNAME,NPAGES,PAGESIZE FROM SYSCAT.BUFFERPOOLS"),
+        Query("E", "E5-query-3-of-5-mdc-indexes", f"SELECT TABSCHEMA,TABNAME,INDNAME,INDEXTYPE FROM SYSCAT.INDEXES WHERE {s} AND INDEXTYPE IN ('BLOK','DIM')"),
+        Query("E", "E5-query-4-of-5-data-partitions", f"SELECT TABNAME,DATAPARTITIONNAME,SEQNO,LOWVALUE,HIGHVALUE FROM SYSCAT.DATAPARTITIONS WHERE {s} ORDER BY TABNAME,SEQNO", True),
+        Query("E", "E5-query-5-of-5-table-organization", f"SELECT TABNAME,COMPRESSION,ROWCOMPMODE,TABLEORG FROM SYSCAT.TABLES WHERE {s} AND TYPE='T'"),
         Query("P9", "09a-object-counts", f"SELECT TYPE,COUNT(*) AS CNT FROM SYSCAT.TABLES WHERE {s} GROUP BY TYPE"),
         Query("P9", "09b-table-metrics", f"SELECT T.TABSCHEMA,T.TABNAME,T.CARD AS EST_ROWS,T.COLCOUNT,T.STATS_TIME,(SELECT COUNT(*) FROM SYSCAT.INDEXES I WHERE I.TABSCHEMA=T.TABSCHEMA AND I.TABNAME=T.TABNAME) IDX_CNT,(SELECT COUNT(*) FROM SYSCAT.TRIGGERS G WHERE G.TABSCHEMA=T.TABSCHEMA AND G.TABNAME=T.TABNAME) TRG_CNT,(SELECT COUNT(*) FROM SYSCAT.REFERENCES R WHERE R.TABSCHEMA=T.TABSCHEMA AND R.TABNAME=T.TABNAME) FK_OUT,T.PARTITION_MODE,T.COMPRESSION,T.TEMPORALTYPE FROM SYSCAT.TABLES T WHERE {ts} AND T.TYPE='T' ORDER BY T.CARD DESC"),
         Query("P9", "09c-physical-size", f"SELECT TABSCHEMA,TABNAME,DATA_OBJECT_P_SIZE+INDEX_OBJECT_P_SIZE+LONG_OBJECT_P_SIZE+LOB_OBJECT_P_SIZE+XML_OBJECT_P_SIZE AS TOTAL_KB FROM SYSIBMADM.ADMINTABINFO WHERE {s} ORDER BY TOTAL_KB DESC"),
@@ -102,8 +155,12 @@ def queries(schemas: list[str]) -> list[Query]:
         Query("P9", "09i-type-mappings", "SELECT * FROM SYSCAT.TYPEMAPPINGS", True),
         Query("P9", "09i-nickname-dependencies", "SELECT DISTINCT D.TABSCHEMA,D.TABNAME,D.BSCHEMA,D.BNAME FROM SYSCAT.TABDEP D JOIN SYSCAT.NICKNAMES N ON N.TABSCHEMA=D.BSCHEMA AND N.TABNAME=D.BNAME", True),
         Query("P10", "10-columns", f"SELECT TABSCHEMA,TABNAME,COLNAME,TYPENAME,LENGTH,SCALE,NULLS,DEFAULT,CODEPAGE,IDENTITY,GENERATED FROM SYSCAT.COLUMNS WHERE {s} ORDER BY TABSCHEMA,TABNAME,COLNO"),
+        Query("P11", "11-routine-bodies", f"SELECT ROUTINESCHEMA,ROUTINENAME,ROUTINETYPE,LANGUAGE,PARM_COUNT,RESULT_SETS,LENGTH(TEXT) TEXT_CHARS,TEXT FROM SYSCAT.ROUTINES WHERE {rs} ORDER BY ROUTINESCHEMA,ROUTINENAME"),
+        Query("P11", "11-trigger-bodies", f"SELECT TRIGSCHEMA,TRIGNAME,TABSCHEMA,TABNAME,TRIGTIME,TRIGEVENT,GRANULARITY,LENGTH(TEXT) TEXT_CHARS,TEXT FROM SYSCAT.TRIGGERS WHERE {trgs} ORDER BY TRIGSCHEMA,TRIGNAME"),
         Query("P11", "11-views", f"SELECT VIEWSCHEMA,VIEWNAME,LENGTH(TEXT) TEXT_CHARS,TEXT FROM SYSCAT.VIEWS WHERE {schema_pred('VIEWSCHEMA', schemas)}"),
+        Query("P11", "11-package-statements", "SELECT PKGSCHEMA,PKGNAME,SECTNO,TEXT FROM SYSCAT.STATEMENTS ORDER BY PKGSCHEMA,PKGNAME,SECTNO", True, "Catalog availability/authority varies; also used by P13"),
         Query("P12", "12-lob-inventory", f"SELECT TABSCHEMA,TABNAME,COLNAME,TYPENAME,LENGTH FROM SYSCAT.COLUMNS WHERE {s} AND TYPENAME IN ('BLOB','CLOB','DBCLOB')"),
+        Query("P12", "12-top-50-tables", f"SELECT TABSCHEMA,TABNAME,CARD AS EST_ROWS FROM SYSCAT.TABLES WHERE {s} AND TYPE='T' ORDER BY CARD DESC FETCH FIRST 50 ROWS ONLY", False, "Drives one actual COUNT(*) per returned table"),
         Query("P13", "13a-read-grants", f"SELECT GRANTEE,GRANTEETYPE,COUNT(*) TABLES_GRANTED FROM SYSCAT.TABAUTH WHERE {s} AND SELECTAUTH IN ('Y','G') GROUP BY GRANTEE,GRANTEETYPE ORDER BY TABLES_GRANTED DESC"),
         Query("P13", "13b-write-grants", f"SELECT GRANTEE,GRANTEETYPE,SUM(CASE WHEN INSERTAUTH IN ('Y','G') THEN 1 ELSE 0 END) CAN_INSERT,SUM(CASE WHEN UPDATEAUTH IN ('Y','G') THEN 1 ELSE 0 END) CAN_UPDATE,SUM(CASE WHEN DELETEAUTH IN ('Y','G') THEN 1 ELSE 0 END) CAN_DELETE FROM SYSCAT.TABAUTH WHERE {s} GROUP BY GRANTEE,GRANTEETYPE ORDER BY CAN_UPDATE DESC"),
         Query("P13", "13c-routine-grants", f"SELECT GRANTEE,GRANTEETYPE,COUNT(*) ROUTINES_GRANTED FROM SYSCAT.ROUTINEAUTH WHERE {schema_pred('SCHEMA', schemas)} AND EXECUTEAUTH IN ('Y','G') GROUP BY GRANTEE,GRANTEETYPE ORDER BY ROUTINES_GRANTED DESC"),
@@ -116,6 +173,42 @@ def queries(schemas: list[str]) -> list[Query]:
         Query("P14", "14-dbauth", "SELECT * FROM SYSCAT.DBAUTH"),
     ]
     return base
+
+
+def validate_query_pack(all_queries: list[Query]) -> dict:
+    """Compare exact identifiers, not only totals, against the manual checklist."""
+    phase_counts: dict[str, int] = {}
+    for query in all_queries:
+        phase_counts[query.phase] = phase_counts.get(query.phase, 0) + 1
+    slugs = [query.slug for query in all_queries]
+    duplicate_slugs = sorted({slug for slug in slugs if slugs.count(slug) > 1})
+    expected_document = set().union(*DOCUMENT_FIXED_SLUGS.values())
+    expected_supplemental = set().union(*SUPPLEMENTAL_FIXED_SLUGS.values())
+    expected = expected_document | expected_supplemental
+    actual = set(slugs)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    expected_by_phase = {}
+    for phase in set(DOCUMENT_FIXED_SLUGS) | set(SUPPLEMENTAL_FIXED_SLUGS):
+        expected_by_phase[phase] = len(DOCUMENT_FIXED_SLUGS.get(phase, set()) | SUPPLEMENTAL_FIXED_SLUGS.get(phase, set()))
+    report = {
+        "status": "ok" if not duplicate_slugs and not missing and not unexpected else "error",
+        "document_fixed_queries": len(expected_document),
+        "supplemental_fixed_queries": len(expected_supplemental),
+        "expected_fixed_queries": len(expected),
+        "actual_fixed_queries": len(all_queries),
+        "expected_by_phase": expected_by_phase,
+        "actual_by_phase": phase_counts,
+        "duplicate_slugs": duplicate_slugs,
+        "missing_query_ids": missing,
+        "unexpected_query_ids": unexpected,
+        "document_query_ids_by_phase": {k: sorted(v) for k, v in DOCUMENT_FIXED_SLUGS.items()},
+        "supplemental_query_ids_by_phase": {k: sorted(v) for k, v in SUPPLEMENTAL_FIXED_SLUGS.items()},
+        "dynamic_document_query": {"P12": "SELECT 'TABLE_NAME' AS T, COUNT(*) FROM MYSCHEMA.TABLE_NAME; generated for up to 50 tables"},
+    }
+    if report["status"] != "ok":
+        raise RuntimeError(f"Phase B query-pack coverage validation failed: {json.dumps(report, sort_keys=True)}")
+    return report
 
 
 def connect(args):
@@ -146,6 +239,37 @@ def execute(conn, sql: str) -> tuple[list[str], list[dict]]:
     return cols, rows
 
 
+def quote_identifier(value: str) -> str:
+    """Quote a catalog-provided DB2 identifier; never accept user SQL here."""
+    return '"' + value.replace('"', '""') + '"'
+
+
+def execute_actual_counts(conn, tables: list[dict], out: Path) -> tuple[list[dict], list[dict]]:
+    """Run the P12 COUNT(*) template for each of the catalog-selected top 50 tables."""
+    rows: list[dict] = []
+    errors: list[dict] = []
+    total = len(tables)
+    for index, table in enumerate(tables, 1):
+        schema = str(table.get("TABSCHEMA", ""))
+        name = str(table.get("TABNAME", ""))
+        sql = f"SELECT COUNT(*) AS ACTUAL_ROWS FROM {quote_identifier(schema)}.{quote_identifier(name)}"
+        slug = f"12-count-{schema}-{name}"
+        LOG.info("START COUNT [%d/%d] %s.%s", index, total, schema, name)
+        LOG.debug("SQL [%s]:\n%s;", slug, sql)
+        try:
+            _, result = execute(conn, sql)
+            actual = result[0].get("ACTUAL_ROWS") if result else None
+            rows.append({"TABSCHEMA": schema, "TABNAME": name, "EST_ROWS": table.get("EST_ROWS"), "ACTUAL_ROWS": actual, "STATUS": "ok", "ERROR": ""})
+            LOG.info("DONE COUNT  [%d/%d] %s.%s | actual_rows=%s", index, total, schema, name, actual)
+        except Exception as exc:
+            error = str(exc)
+            rows.append({"TABSCHEMA": schema, "TABNAME": name, "EST_ROWS": table.get("EST_ROWS"), "ACTUAL_ROWS": "", "STATUS": "error", "ERROR": error})
+            errors.append({"slug": slug, "optional": False, "error": error})
+            LOG.exception("FAILED COUNT [%d/%d] %s.%s | error=%s", index, total, schema, name, error)
+    write_csv(out / "12-actual-row-counts.csv", ["TABSCHEMA", "TABNAME", "EST_ROWS", "ACTUAL_ROWS", "STATUS", "ERROR"], rows)
+    return rows, errors
+
+
 def write_csv(path: Path, cols: list[str], rows: Iterable[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as f:
@@ -156,13 +280,14 @@ def write_csv(path: Path, cols: list[str], rows: Iterable[dict]) -> None:
 
 
 def build_environment_md(out: Path, results: dict[str, list[dict]], errors: list[dict]) -> None:
-    inst = (results.get("E1-env-inst-info") or [{}])[0]
-    cfg = {str(r.get("NAME", "")).lower(): r.get("VALUE") for r in results.get("E3-dbcfg", [])}
-    regs = {str(r.get("NAME", "")): r.get("VALUE") for r in results.get("E4-reg-variables", [])}
+    version = (results.get("E1-query-1-of-3-version-fixpack") or [{}])[0]
+    topology = (results.get("E1-query-2-of-3-instance-topology") or [{}])[0]
+    cfg = {str(r.get("NAME", "")).lower(): r.get("VALUE") for r in results.get("E3-query-1-of-1-dbcfg", [])}
+    regs = {str(r.get("NAME", "")): r.get("VALUE") for r in results.get("E4-query-1-of-2-reg-variables-filtered", [])}
     text = ["# DB2 LUW environment profile", "", f"Generated: {datetime.now(timezone.utc).isoformat()}", "",
-            f"- Service level: {inst.get('SERVICE_LEVEL', 'NOT DETERMINED')}",
-            f"- Fixpack: {inst.get('FIXPACK_NUM', 'NOT DETERMINED')}",
-            f"- Partitions: {inst.get('NUM_DBPARTITIONS', 'NOT DETERMINED')}",
+            f"- Service level: {version.get('SERVICE_LEVEL', 'NOT DETERMINED')}",
+            f"- Fixpack: {version.get('FIXPACK_NUM', 'NOT DETERMINED')}",
+            f"- Partitions: {topology.get('NUM_DBPARTITIONS', 'NOT DETERMINED')}",
             f"- Codeset/codepage: {cfg.get('codeset', 'NOT DETERMINED')} / {cfg.get('codepage', 'NOT DETERMINED')}",
             f"- Territory/collation: {cfg.get('territory', 'NOT DETERMINED')} / {cfg.get('collate_info', 'NOT DETERMINED')}",
             f"- string_units: {cfg.get('string_units', 'NOT DETERMINED')}",
@@ -185,6 +310,7 @@ def parse_args():
     p.add_argument("--dry-run", action="store_true", help="Write rendered SQL only; no DB connection")
     p.add_argument("--log-file", default="", help="Log path; default: <output>/00-extraction.log")
     p.add_argument("--verbose", action="store_true", help="Show full SQL in the console as well as the log file")
+    p.add_argument("--skip-actual-counts", action="store_true", help="Skip P12 COUNT(*) for the top 50 tables (may be expensive)")
     return p.parse_args()
 
 
@@ -194,10 +320,14 @@ def main() -> int:
     if not schemas or any(not re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", x) for x in schemas):
         raise SystemExit("Invalid --schemas; use comma-separated unquoted DB2 identifiers")
     selected = {x.strip().upper() for x in args.phases.split(",")}
-    qs = [q for q in queries(schemas) if q.phase.upper() in selected]
+    all_queries = queries(schemas)
+    coverage = validate_query_pack(all_queries)
+    qs = [q for q in all_queries if q.phase.upper() in selected]
     out = Path(args.output).resolve(); out.mkdir(parents=True, exist_ok=True)
     log_file = Path(args.log_file).resolve() if args.log_file else out / "00-extraction.log"
     configure_logging(log_file, args.verbose)
+    (out / "00-query-coverage.json").write_text(json.dumps(coverage, indent=2), encoding="utf-8")
+    LOG.info("Query-pack coverage verified | fixed_queries=%d | E4_queries=2 | dynamic_P12_counts=up_to_50", coverage["actual_fixed_queries"])
     LOG.info("Starting DB2 Phase B extraction | schemas=%s | phases=%s | dry_run=%s", ",".join(schemas), ",".join(sorted(selected)), args.dry_run)
     (out / "00-query-plan.sql").write_text("\n\n".join(f"-- {q.phase} {q.slug}\n{q.sql};" for q in qs) + "\n", encoding="utf-8")
     manifest = {"generated_at": datetime.now(timezone.utc).isoformat(), "schemas": schemas, "dry_run": args.dry_run, "queries": []}
@@ -205,6 +335,9 @@ def main() -> int:
         for index, q in enumerate(qs, 1):
             LOG.info("DRY-RUN [%d/%d] %s %s", index, len(qs), q.phase, q.slug)
             LOG.debug("SQL [%s]:\n%s;", q.slug, q.sql)
+            manifest["queries"].append({"phase": q.phase, "slug": q.slug, "optional": q.optional, "note": q.note, "status": "planned"})
+        if "P12" in selected and not args.skip_actual_counts:
+            manifest["queries"].append({"phase": "P12", "slug": "12-actual-row-counts", "status": "planned_dynamic", "detail": "One quoted COUNT(*) per row returned by 12-top-50-tables"})
         (out / "00-extraction-manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         LOG.info("Dry run completed | query_plan=%s | queries=%d", out / "00-query-plan.sql", len(qs))
         return 0
@@ -227,6 +360,19 @@ def main() -> int:
                 item.update(status="error", error=err); errors.append({"slug": q.slug, "optional": q.optional, "error": err})
                 LOG.exception("FAILED [%d/%d] %s | optional=%s | error=%s", index, len(qs), q.slug, q.optional, err)
             manifest["queries"].append(item)
+        top_tables = results.get("12-top-50-tables", [])
+        if "P12" in selected and top_tables and not args.skip_actual_counts:
+            LOG.info("Starting P12 actual row counts for %d catalog-selected tables", len(top_tables))
+            count_rows, count_errors = execute_actual_counts(conn, top_tables, out)
+            errors.extend(count_errors)
+            manifest["queries"].append({
+                "phase": "P12", "slug": "12-actual-row-counts", "optional": False,
+                "status": "error" if count_errors else "ok", "rows": len(count_rows),
+                "failed_tables": len(count_errors), "file": "12-actual-row-counts.csv",
+            })
+        elif "P12" in selected and args.skip_actual_counts:
+            LOG.warning("P12 actual COUNT(*) queries skipped by --skip-actual-counts")
+            manifest["queries"].append({"phase": "P12", "slug": "12-actual-row-counts", "status": "skipped", "reason": "--skip-actual-counts"})
     finally:
         ibm_db.close(conn)
         LOG.info("DB2 connection closed")
