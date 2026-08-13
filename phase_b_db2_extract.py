@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase B extractor for the DB2 LUW -> PostgreSQL assessment prompt pack.
+"""Phase B extractor with per-query logging for DB2 LUW -> PostgreSQL.
 
 Requires: pip install ibm_db
 Credentials are never stored in output. Connection values come from CLI/env.
@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import os
 import re
 import sys
@@ -31,6 +32,29 @@ class Query:
     sql: str
     optional: bool = False
     note: str = ""
+
+
+LOG = logging.getLogger("phase_b_db2_extract")
+
+
+def configure_logging(log_file: Path, verbose: bool) -> None:
+    """Log progress to console and a UTF-8 file without connection secrets."""
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    LOG.setLevel(logging.DEBUG)
+    LOG.handlers.clear()
+    formatter = logging.Formatter(
+        "%(asctime)sZ | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    formatter.converter = __import__("time").gmtime
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setFormatter(formatter)
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    LOG.addHandler(console)
+    LOG.addHandler(file_handler)
 
 
 def schema_pred(column: str, schemas: list[str]) -> str:
@@ -159,6 +183,8 @@ def parse_args():
     p.add_argument("--password", default="", help="Prefer DB2_PASSWORD environment variable")
     p.add_argument("--phases", default="E,P9,P10,P11,P12,P13,P14")
     p.add_argument("--dry-run", action="store_true", help="Write rendered SQL only; no DB connection")
+    p.add_argument("--log-file", default="", help="Log path; default: <output>/00-extraction.log")
+    p.add_argument("--verbose", action="store_true", help="Show full SQL in the console as well as the log file")
     return p.parse_args()
 
 
@@ -170,30 +196,43 @@ def main() -> int:
     selected = {x.strip().upper() for x in args.phases.split(",")}
     qs = [q for q in queries(schemas) if q.phase.upper() in selected]
     out = Path(args.output).resolve(); out.mkdir(parents=True, exist_ok=True)
+    log_file = Path(args.log_file).resolve() if args.log_file else out / "00-extraction.log"
+    configure_logging(log_file, args.verbose)
+    LOG.info("Starting DB2 Phase B extraction | schemas=%s | phases=%s | dry_run=%s", ",".join(schemas), ",".join(sorted(selected)), args.dry_run)
     (out / "00-query-plan.sql").write_text("\n\n".join(f"-- {q.phase} {q.slug}\n{q.sql};" for q in qs) + "\n", encoding="utf-8")
     manifest = {"generated_at": datetime.now(timezone.utc).isoformat(), "schemas": schemas, "dry_run": args.dry_run, "queries": []}
     if args.dry_run:
+        for index, q in enumerate(qs, 1):
+            LOG.info("DRY-RUN [%d/%d] %s %s", index, len(qs), q.phase, q.slug)
+            LOG.debug("SQL [%s]:\n%s;", q.slug, q.sql)
         (out / "00-extraction-manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        print(f"Dry run: wrote {out / '00-query-plan.sql'}")
+        LOG.info("Dry run completed | query_plan=%s | queries=%d", out / "00-query-plan.sql", len(qs))
         return 0
+    LOG.info("Opening DB2 connection (connection parameters are not logged)")
     conn = connect(args); results: dict[str, list[dict]] = {}; errors = []
+    LOG.info("DB2 connection established")
     try:
-        for q in qs:
+        for index, q in enumerate(qs, 1):
             item = {"phase": q.phase, "slug": q.slug, "optional": q.optional, "note": q.note}
+            LOG.info("START [%d/%d] %s %s | optional=%s", index, len(qs), q.phase, q.slug, q.optional)
+            LOG.debug("SQL [%s]:\n%s;", q.slug, q.sql)
             try:
                 cols, rows = execute(conn, q.sql)
                 write_csv(out / f"{q.slug}.csv", cols, rows)
                 results[q.slug] = rows
                 item.update(status="ok", rows=len(rows), file=f"{q.slug}.csv")
+                LOG.info("DONE  [%d/%d] %s | rows=%d | file=%s", index, len(qs), q.slug, len(rows), out / f"{q.slug}.csv")
             except Exception as exc:
                 err = str(exc).replace(args.password, "<REDACTED>") if args.password else str(exc)
                 item.update(status="error", error=err); errors.append({"slug": q.slug, "optional": q.optional, "error": err})
-                print(f"WARNING {q.slug}: {err}", file=sys.stderr)
+                LOG.exception("FAILED [%d/%d] %s | optional=%s | error=%s", index, len(qs), q.slug, q.optional, err)
             manifest["queries"].append(item)
     finally:
         ibm_db.close(conn)
+        LOG.info("DB2 connection closed")
     build_environment_md(out / "00-environment.md", results, errors)
     (out / "00-extraction-manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    LOG.info("Extraction completed | successful=%d | failed=%d | log=%s", sum(q.get("status") == "ok" for q in manifest["queries"]), len(errors), log_file)
     return 2 if any(not e["optional"] for e in errors) else 0
 
 
